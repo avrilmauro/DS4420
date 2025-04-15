@@ -1,0 +1,546 @@
+---
+title: "DS4420_FinalProject"
+author: "Heidi Eren, Avril Mauro, Dennis Ho"
+date: "2025-04-12"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(
+  echo = TRUE,           # Show code
+  results = 'markup',    # Show console output as regular markdown text
+  warning = TRUE,        # Show warnings
+  message = TRUE,        # Show messages
+  fig.align = 'center',  # Center align figures
+  comment = ''           # Remove the ## prefix from console output
+)
+sink("output-file.txt")
+```
+
+```{r}
+# load in libraries
+library(keras)
+library(tensorflow)
+library(tidyverse)
+library(caret)
+```
+
+
+
+```{r}
+# MLP model
+# Recipe Rating Prediction in R
+
+# Set random seeds for reproducibility
+set.seed(42)
+tensorflow::set_random_seed(42)
+
+# Load in all data files
+X_user_train <- as.matrix(read.csv("X_user_train.csv", header = FALSE))
+X_recipe_train <- as.matrix(read.csv("X_recipe_train.csv", header = FALSE))
+X_features_train <- as.matrix(read.csv("X_features_train.csv", header = FALSE))
+y_train <- as.matrix(read.csv("y_train.csv", header = FALSE))
+X_user_test <- as.matrix(read.csv("X_user_test.csv", header = FALSE))
+X_recipe_test <- as.matrix(read.csv("X_recipe_test.csv", header = FALSE))
+X_features_test <- as.matrix(read.csv("X_features_test.csv", header = FALSE))
+y_test <- as.matrix(read.csv("y_test.csv", header = FALSE))
+
+recipes_mlp <- read.csv("recipes_mlp.csv")
+
+```
+
+```{r}
+# Create user and recipe maps
+user_ids <- unique(recipes_mlp$user_id)
+recipe_ids <- unique(recipes_mlp$recipe_id)
+user_map <- setNames(seq_along(user_ids) - 1, user_ids)  # 0-based indexing for Keras
+recipe_map <- setNames(seq_along(recipe_ids) - 1, recipe_ids)
+
+```
+
+```{r}
+
+# define hyperparameter grid
+param_grid <- list(
+  embedding_dim = c(16, 32, 48, 64),
+  units1 = c(64, 128, 256),
+  dropout1 = c(0.2, 0.3, 0.4),
+  units2 = c(32, 64, 128),
+  dropout2 = c(0.2, 0.3, 0.4),
+  learning_rate = c(0.0001, 0.0005, 0.001),
+  batch_size = c(32, 64, 128)
+)
+
+# create model with specific parameters
+create_model <- function(params, user_map, recipe_map, x_features_shape) {
+  # define input layers
+  user_input <- layer_input(shape = 1, name = "user_input")
+  recipe_input <- layer_input(shape = 1, name = "recipe_input")
+  features_input <- layer_input(shape = x_features_shape, name = "features_input")
+  
+  # embedding layers
+  user_embedding <- user_input %>%
+    layer_embedding(
+      input_dim = length(user_map),
+      output_dim = params$embedding_dim,
+      name = "user_embedding"
+    ) %>%
+    layer_flatten()
+  
+  recipe_embedding <- recipe_input %>%
+    layer_embedding(
+      input_dim = length(recipe_map),
+      output_dim = params$embedding_dim,
+      name = "recipe_embedding"
+    ) %>%
+    layer_flatten()
+  
+  # process features
+  features_processed <- features_input %>%
+    layer_dense(units = params$units1, activation = "relu") %>%
+    layer_dropout(rate = params$dropout1)
+  
+  # combine all features
+  combined <- layer_concatenate(list(user_embedding, recipe_embedding, features_processed))
+  
+  # hidden layers
+  x <- combined %>%
+    layer_dense(units = params$units1, activation = "relu") %>%
+    layer_dropout(rate = params$dropout1) %>%
+    layer_dense(units = params$units2, activation = "relu") %>%
+    layer_dropout(rate = params$dropout2)
+  
+  # output layer
+  output <- x %>%
+    layer_dense(units = 1, activation = "linear")
+  
+  # create model
+  model <- keras_model(
+    inputs = list(user_input, recipe_input, features_input),
+    outputs = output
+  )
+  
+  # compile model
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = params$learning_rate),
+    loss = "mean_squared_error",
+    metrics = c("mae", "mse")
+  )
+  
+  return(model)
+}
+
+```
+
+```{r}
+# train and evaluate MLP model
+train_evaluate_model <- function(params, X_user_train, X_recipe_train, X_features_train, y_train,
+                                X_user_test, X_recipe_test, X_features_test, y_test,
+                                user_map, recipe_map) {
+  tryCatch({
+    # Create model
+    model <- create_model(params, user_map, recipe_map, ncol(X_features_train))
+    
+    # Callbacks
+    callbacks <- list(
+      callback_early_stopping(
+        monitor = "val_loss",
+        patience = 5,
+        restore_best_weights = TRUE,
+        verbose = 0
+      )
+    )
+    
+    # train model
+    history <- model %>% fit(
+      x = list(X_user_train, X_recipe_train, X_features_train),
+      y = y_train,
+      validation_data = list(
+        list(X_user_test, X_recipe_test, X_features_test),
+        y_test
+      ),
+      epochs = 10,
+      batch_size = params$batch_size,
+      callbacks = callbacks,
+      verbose = 0
+    )
+    
+    # get validation metrics
+    val_mse <- min(history$metrics$val_loss)
+    val_mae <- min(history$metrics$val_mae)
+    
+    return(list(
+      model = model,
+      val_mse = val_mse,
+      val_mae = val_mae,
+      params = params,
+      history = history
+    ))
+  }, error = function(e) {
+    cat(sprintf("Error with parameters %s: %s\n", toJSON(params), e$message))
+    return(list(
+      model = NULL,
+      val_mse = Inf,
+      val_mae = Inf,
+      params = params,
+      history = NULL
+    ))
+  })
+}
+
+```
+
+
+```{r}
+# perform random grid search
+random_grid_search <- function(param_grid, n_iter, X_user_train, X_recipe_train, X_features_train, y_train,
+                              X_user_test, X_recipe_test, X_features_test, y_test,
+                              user_map, recipe_map) {
+  
+  # generate n_iter random parameter combinations
+  param_combinations <- list()
+  for (i in 1:n_iter) {
+    params <- list()
+    for (param_name in names(param_grid)) {
+      param_values <- param_grid[[param_name]]
+      params[[param_name]] <- sample(param_values, 1)[[1]]
+    }
+    param_combinations[[i]] <- params
+  }
+  
+  # train and evaluate models
+  results <- list()
+  cat("Training models\n")
+  pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+  for (i in 1:length(param_combinations)) {
+    params <- param_combinations[[i]]
+    cat(sprintf("\nTraining model %d of %d\n", i, n_iter))
+    cat(sprintf("Parameters: %s\n", toJSON(params)))
+    setTxtProgressBar(pb, i)
+    
+    result <- train_evaluate_model(
+      params, X_user_train, X_recipe_train, X_features_train, y_train,
+      X_user_test, X_recipe_test, X_features_test, y_test,
+      user_map, recipe_map
+    )
+    
+    results[[i]] <- result
+  }
+  close(pb)
+  
+  # find best combination model
+  val_mse_values <- sapply(results, function(x) x$val_mse)
+  best_index <- which.min(val_mse_values)
+  best_result <- results[[best_index]]
+  
+  return(list(results = results, best_result = best_result))
+}
+
+```
+
+```{r}
+
+# create ensemble predictions from multiple models
+create_ensemble <- function(results, X_user_test, X_recipe_test, X_features_test, y_test, top_n = 3) {
+  # Sort results by validation MSE (lower is better)
+  val_mse_values <- sapply(results, function(x) x$val_mse)
+  sorted_indices <- order(val_mse_values)
+  sorted_results <- results[sorted_indices]
+  
+  # take the top N models
+  top_models <- sorted_results[1:min(top_n, length(sorted_results))]
+  cat(sprintf("\nCreating ensemble from top %d models:\n", top_n))
+  for (i in 1:length(top_models)) {
+    result <- top_models[[i]]
+    cat(sprintf("Model %d validation MSE: %f\n", i, result$val_mse))
+    for (param_name in names(result$params)) {
+      cat(sprintf("  %s: %s\n", param_name, toString(result$params[[param_name]])))
+    }
+  }
+  
+  # make predictions with each model
+  predictions_list <- list()
+  for (result in top_models) {
+    model <- result$model
+    if (!is.null(model)) {
+      preds <- predict(model, list(X_user_test, X_recipe_test, X_features_test))
+      predictions_list <- c(predictions_list, list(preds))
+      cat(sprintf("Added predictions with shape %s\n", paste(dim(preds), collapse = "x")))
+    }
+  }
+  
+  # check if we have any valid predictions
+  if (length(predictions_list) == 0) {
+    cat("No valid models found for ensemble\n")
+    return(NULL)
+  }
+  
+  # combine predictions (simple average)
+  predictions_array <- simplify2array(predictions_list)
+  ensemble_predictions <- rowMeans(predictions_array)
+  
+  # calculate metrics
+  mae <- mean(abs(y_test - ensemble_predictions))
+  mse <- mean((y_test - ensemble_predictions)^2)
+  rmse <- sqrt(mse)
+  r2 <- 1 - sum((y_test - ensemble_predictions)^2) / sum((y_test - mean(y_test))^2)
+  
+  return(list(
+    predictions = ensemble_predictions,
+    mae = mae,
+    mse = mse,
+    rmse = rmse,
+    r2 = r2
+  ))
+}
+
+```
+
+```{r}
+
+# create a weighted ensemble based on validation performance
+create_weighted_ensemble <- function(results, X_user_test, X_recipe_test, X_features_test, y_test, top_n = 3) {
+  # sort results by validation MSE
+  val_mse_values <- sapply(results, function(x) x$val_mse)
+  sorted_indices <- order(val_mse_values)
+  sorted_results <- results[sorted_indices]
+  
+  # take the top N models
+  top_models <- sorted_results[1:min(top_n, length(sorted_results))]
+  cat(sprintf("\nCreating weighted ensemble from top %d models:\n", top_n))
+  
+  # make predictions with each model
+  predictions_list <- list()
+  val_mse_list <- numeric()
+  
+  for (i in 1:length(top_models)) {
+    result <- top_models[[i]]
+    model <- result$model
+    val_mse <- result$val_mse
+    
+    if (!is.null(model) && is.finite(val_mse)) {
+      preds <- predict(model, list(X_user_test, X_recipe_test, X_features_test))
+      predictions_list <- c(predictions_list, list(preds))
+      val_mse_list <- c(val_mse_list, val_mse)
+      cat(sprintf("Model %d validation MSE: %f\n", i, val_mse))
+    }
+  }
+  
+  # Check if we have any valid predictions
+  if (length(predictions_list) == 0) {
+    cat("No valid models found for ensemble\n")
+    return(NULL)
+  }
+  
+  # Calculate weights (inverse of MSE)
+  weights <- 1.0 / val_mse_list
+  normalized_weights <- weights / sum(weights)
+  
+  cat("Model weights in ensemble:\n")
+  for (i in 1:length(normalized_weights)) {
+    cat(sprintf("  Model %d weight: %.4f\n", i, normalized_weights[i]))
+  }
+  
+  # Combine predictions with weights
+  predictions_array <- simplify2array(predictions_list)
+  weighted_sum <- apply(predictions_array, 1, function(row) sum(row * normalized_weights))
+  ensemble_predictions <- weighted_sum
+  
+  # Calculate metrics
+  mae <- mean(abs(y_test - ensemble_predictions))
+  mse <- mean((y_test - ensemble_predictions)^2)
+  rmse <- sqrt(mse)
+  r2 <- 1 - sum((y_test - ensemble_predictions)^2) / sum((y_test - mean(y_test))^2)
+  
+  return(list(
+    predictions = ensemble_predictions,
+    mae = mae,
+    mse = mse,
+    rmse = rmse,
+    r2 = r2
+  ))
+}
+
+# Helper function for JSON representation
+toJSON <- function(x) {
+  jsonlite::toJSON(x, auto_unbox = TRUE)
+}
+```
+
+```{r}
+
+# run MLP model
+main <- function() {
+  # set random seed
+  set.seed(42)
+  tensorflow::set_random_seed(42)
+  
+  # perform random grid search
+  n_iter <- 10
+  search_results <- random_grid_search(
+    param_grid, n_iter, 
+    X_user_train, X_recipe_train, X_features_train, y_train,
+    X_user_test, X_recipe_test, X_features_test, y_test,
+    user_map, recipe_map
+  )
+  
+  results <- search_results$results
+  best_result <- search_results$best_result
+  
+  # print best parameters
+  cat("\n\nBest validation MSE:", best_result$val_mse, "\n")
+  cat("Best validation MAE:", best_result$val_mae, "\n")
+  cat("Best parameters:\n")
+  for (param_name in names(best_result$params)) {
+    cat(sprintf("  %s: %s\n", param_name, toString(best_result$params[[param_name]])))
+  }
+  
+  # initialize metrics variables
+  mae <- NA
+  mse <- NA
+  rmse <- NA
+  r2 <- NA
+  
+  # evaluate best model on test set
+  best_model <- best_result$model
+  if (!is.null(best_model)) {
+    # Make predictions
+    predictions <- predict(
+      best_model,
+      list(X_user_test, X_recipe_test, X_features_test)
+    )
+    
+    # ensure predictions is the right shape
+    predictions <- as.vector(predictions)
+    
+    # calculate metrics
+    mae <- mean(abs(y_test - predictions))
+    mse <- mean((y_test - predictions)^2)
+    rmse <- sqrt(mse)
+    r2 <- 1 - sum((y_test - predictions)^2) / sum((y_test - mean(y_test))^2)
+    
+    # print metrics
+    cat("\nTest Set Metrics for Best Single Model:\n")
+    cat(sprintf("Mean Absolute Error: %.4f\n", mae))
+    cat(sprintf("Mean Squared Error: %.4f\n", mse))
+    cat(sprintf("Root Mean Squared Error: %.4f\n", rmse))
+    cat(sprintf("R-squared: %.4f\n", r2))
+    
+    # plot 1: training history
+# Reset plot parameters first to ensure clean slate
+par(mfrow = c(1, 1), mar = c(4, 4, 2, 1))
+plot(best_result$history$metrics$loss, type = "l", col = "blue", 
+     xlab = "Epoch", ylab = "Loss", main = "Training and Validation Loss")
+lines(best_result$history$metrics$val_loss, col = "red")
+legend("topright", legend = c("Training Loss", "Validation Loss"), 
+       col = c("blue", "red"), lty = 1)
+
+
+# plot 2: predictions vs actual
+par(mar = c(4, 4, 2, 1))  # Set margins for this plot
+plot(y_test, predictions, pch = 16, col = adjustcolor("black", alpha.f = 0.3),
+     xlab = "Actual Ratings", ylab = "Predicted Ratings", 
+     main = "Best Single Model: Predictions vs Actual")
+abline(a = 0, b = 1, col = "red", lty = 2)
+  }
+  
+  # create simple ensemble
+  cat("\n\nEvaluating simple ensemble model (top 3 models):\n")
+  ensemble_results <- create_ensemble(
+    results, 
+    X_user_test, X_recipe_test, X_features_test, 
+    y_test,
+    top_n = 3
+  )
+  
+  if (!is.null(ensemble_results)) {
+    # print ensemble metrics
+    cat("\nSimple Ensemble Model Metrics:\n")
+    cat(sprintf("Mean Absolute Error: %.4f\n", ensemble_results$mae))
+    cat(sprintf("Mean Squared Error: %.4f\n", ensemble_results$mse))
+    cat(sprintf("Root Mean Squared Error: %.4f\n", ensemble_results$rmse))
+    cat(sprintf("R-squared: %.4f\n", ensemble_results$r2))
+    
+    # plot ensemble results
+    plot(y_test, ensemble_results$predictions, pch = 16, 
+         col = adjustcolor("black", alpha.f = 0.3),
+         xlab = "Actual Ratings", ylab = "Predicted Ratings", 
+         main = "Simple Ensemble Model: Predictions vs Actual")
+    abline(a = 0, b = 1, col = "red", lty = 2)
+  }
+  
+  # create weighted ensemble
+  cat("\n\nEvaluating weighted ensemble model (top 5 models):\n")
+  weighted_ensemble_results <- create_weighted_ensemble(
+    results, 
+    X_user_test, X_recipe_test, X_features_test, 
+    y_test,
+    top_n = 5
+  )
+  
+  if (!is.null(weighted_ensemble_results)) {
+    # print weighted ensemble metrics
+    cat("\nWeighted Ensemble Model Metrics:\n")
+    cat(sprintf("Mean Absolute Error: %.4f\n", weighted_ensemble_results$mae))
+    cat(sprintf("Mean Squared Error: %.4f\n", weighted_ensemble_results$mse))
+    cat(sprintf("Root Mean Squared Error: %.4f\n", weighted_ensemble_results$rmse))
+    cat(sprintf("R-squared: %.4f\n", weighted_ensemble_results$r2))
+    
+    # plot weighted ensemble results
+    plot(y_test, weighted_ensemble_results$predictions, pch = 16, 
+         col = adjustcolor("black", alpha.f = 0.3),
+         xlab = "Actual Ratings", ylab = "Predicted Ratings", 
+         main = "Weighted Ensemble Model: Predictions vs Actual")
+    abline(a = 0, b = 1, col = "red", lty = 2)
+    
+    # compare all methods
+    methods <- c("Best Single Model", "Simple Ensemble", "Weighted Ensemble")
+    mae_values <- c(mae, ensemble_results$mae, weighted_ensemble_results$mae)
+    mse_values <- c(mse, ensemble_results$mse, weighted_ensemble_results$mse)
+    rmse_values <- c(rmse, ensemble_results$rmse, weighted_ensemble_results$rmse)
+    r2_values <- c(r2, ensemble_results$r2, weighted_ensemble_results$r2)
+    
+    # Plot comparison
+    par(mfrow = c(2, 2), mar = c(5, 4, 2, 1))
+    
+    barplot(mae_values, names.arg = methods, main = "Mean Absolute Error (Lower is Better)", 
+            cex.names = 0.8, las = 2)
+    
+    barplot(mse_values, names.arg = methods, main = "Mean Squared Error (Lower is Better)", 
+            cex.names = 0.8, las = 2)
+    
+    barplot(rmse_values, names.arg = methods, main = "Root Mean Squared Error (Lower is Better)", 
+            cex.names = 0.8, las = 2)
+    
+    barplot(r2_values, names.arg = methods, main = "R-squared (Higher is Better)", 
+            cex.names = 0.8, las = 2)
+    
+    # Reset plot parameters
+    par(mfrow = c(1, 1))
+  }
+  
+  # return results for further use if needed
+  return(list(
+    best_single_model = list(
+      model = best_model,
+      params = best_result$params,
+      mae = mae,
+      mse = mse,
+      rmse = rmse,
+      r2 = r2
+    ),
+    simple_ensemble = ensemble_results,
+    weighted_ensemble = weighted_ensemble_results
+  ))
+}
+
+
+main()
+
+
+sink()
+```
+
+
